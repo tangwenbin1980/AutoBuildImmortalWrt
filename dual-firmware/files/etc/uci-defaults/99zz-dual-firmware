@@ -1,0 +1,191 @@
+#!/bin/sh
+
+set -eu
+
+VARIANT_FILE="${FIRMWARE_VARIANT_FILE:-/etc/firmware_variant.txt}"
+SYS_CLASS_NET="${SYS_CLASS_NET:-/sys/class/net}"
+LOGFILE="${DUAL_FIRMWARE_LOGFILE:-/etc/dual-firmware-firstboot.log}"
+
+log() {
+	printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$LOGFILE"
+}
+
+fail() {
+	log "ERROR: $*"
+	exit 1
+}
+
+get_variant() {
+	awk -F= '$1 == "firmware_variant" { print $2; exit }' "$VARIANT_FILE"
+}
+
+physical_interfaces() {
+	for path in "$SYS_CLASS_NET"/*; do
+		[ -e "$path" ] || continue
+		name=${path##*/}
+		case "$name" in
+			lo | br-* | docker* | veth* | tun* | tap* | wg* | ppp* | ifb* | gre* | sit* | ip6tnl*)
+				continue
+				;;
+		esac
+		[ -e "$path/device" ] || continue
+		case "$name" in
+			eth* | en*) printf '%s\n' "$name" ;;
+		esac
+	done | sort
+}
+
+find_section() {
+	package=$1
+	type=$2
+	option=$3
+	value=$4
+
+	uci -q show "$package" |
+		sed -n "s/^${package}\.\([^.=]*\)=${type}$/\1/p" |
+		while IFS= read -r section; do
+			[ "$(uci -q get "${package}.${section}.${option}" 2>/dev/null || true)" = "$value" ] || continue
+			printf '%s\n' "$section"
+			break
+		done
+}
+
+ensure_bridge_section() {
+	section=$(find_section network device name br-lan || true)
+	if [ -z "$section" ]; then
+		section='dual_br_lan'
+		uci set "network.${section}=device"
+		uci set "network.${section}.name=br-lan"
+		uci set "network.${section}.type=bridge"
+	fi
+	printf '%s\n' "$section"
+}
+
+set_bridge_ports() {
+	bridge_section=$1
+	shift
+	uci -q delete "network.${bridge_section}.ports" || true
+	for port in "$@"; do
+		uci add_list "network.${bridge_section}.ports=${port}"
+	done
+}
+
+disable_interface() {
+	interface=$1
+	uci set "network.${interface}=interface"
+	uci set "network.${interface}.proto=none"
+	uci set "network.${interface}.auto=0"
+	uci set "network.${interface}.disabled=1"
+	uci -q delete "network.${interface}.device" || true
+	uci -q delete "network.${interface}.ifname" || true
+}
+
+remove_lan_wan_forwardings() {
+	uci -q show firewall |
+		sed -n 's/^firewall\.\([^.=]*\)=forwarding$/\1/p' |
+		while IFS= read -r section; do
+			src=$(uci -q get "firewall.${section}.src" 2>/dev/null || true)
+			dest=$(uci -q get "firewall.${section}.dest" 2>/dev/null || true)
+			if [ "$src" = 'lan' ] && [ "$dest" = 'wan' ]; then
+				uci -q delete "firewall.${section}" || true
+			fi
+		done
+}
+
+configure_nikki_controller() {
+	uci set "nikki.mixin.api_listen=[::]:9090"
+	uci set "nikki.mixin.api_secret=abc123"
+	uci set "nikki.mixin.ui_url=https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"
+}
+
+variant=$(get_variant)
+[ -n "$variant" ] || fail "firmware variant is missing"
+
+interfaces=$(physical_interfaces)
+interface_count=$(printf '%s\n' "$interfaces" | awk 'NF { count++ } END { print count + 0 }')
+[ "$interface_count" -gt 0 ] || fail "no physical Ethernet interface detected"
+
+bridge_section=$(ensure_bridge_section)
+
+case "$variant" in
+	home-bypass)
+		# shellcheck disable=SC2086
+		set_bridge_ports "$bridge_section" $interfaces
+
+		uci set "network.lan=interface"
+		uci set "network.lan.device=br-lan"
+		uci set "network.lan.proto=static"
+		uci set "network.lan.ipaddr=10.0.0.2"
+		uci set "network.lan.netmask=255.255.255.0"
+		uci set "network.lan.gateway=10.0.0.1"
+
+		disable_interface wan
+		disable_interface wan6
+
+		uci set "dhcp.lan.ignore=1"
+		uci set "dhcp.lan.ra=disabled"
+		uci set "dhcp.lan.dhcpv6=disabled"
+		uci set "dhcp.lan.ndp=disabled"
+
+		wan_zone=$(find_section firewall zone name wan || true)
+		if [ -n "$wan_zone" ]; then
+			uci set "firewall.${wan_zone}.masq=0"
+		fi
+		remove_lan_wan_forwardings
+		;;
+
+	office-gateway)
+		printf '%s\n' "$interfaces" | grep -qx 'eth0' || fail "office-gateway requires physical eth0"
+		lan_interfaces=$(printf '%s\n' "$interfaces" | grep -vx 'eth0' || true)
+		lan_count=$(printf '%s\n' "$lan_interfaces" | awk 'NF { count++ } END { print count + 0 }')
+		[ "$lan_count" -gt 0 ] || fail "office-gateway requires at least one LAN interface besides eth0"
+
+		# shellcheck disable=SC2086
+		set_bridge_ports "$bridge_section" $lan_interfaces
+
+		uci set "network.lan=interface"
+		uci set "network.lan.device=br-lan"
+		uci set "network.lan.proto=static"
+		uci set "network.lan.ipaddr=192.168.10.1"
+		uci set "network.lan.netmask=255.255.255.0"
+		uci -q delete "network.lan.gateway" || true
+
+		uci set "network.wan=interface"
+		uci set "network.wan.device=eth0"
+		uci set "network.wan.proto=dhcp"
+		uci set "network.wan.auto=1"
+		uci -q delete "network.wan.disabled" || true
+		disable_interface wan6
+
+		uci set "dhcp.lan.ignore=0"
+		uci set "dhcp.lan.start=100"
+		uci set "dhcp.lan.limit=150"
+		uci set "dhcp.lan.leasetime=12h"
+		uci set "dhcp.lan.ra=disabled"
+		uci set "dhcp.lan.dhcpv6=disabled"
+		uci set "dhcp.lan.ndp=disabled"
+
+		wan_zone=$(find_section firewall zone name wan || true)
+		[ -n "$wan_zone" ] || fail "WAN firewall zone not found"
+		uci set "firewall.${wan_zone}.masq=1"
+		uci set "firewall.${wan_zone}.mtu_fix=1"
+		remove_lan_wan_forwardings
+		uci set "firewall.dual_lan_wan=forwarding"
+		uci set "firewall.dual_lan_wan.src=lan"
+		uci set "firewall.dual_lan_wan.dest=wan"
+		;;
+
+	*)
+		fail "unsupported firmware variant: $variant"
+		;;
+esac
+
+configure_nikki_controller
+
+uci commit network
+uci commit dhcp
+uci commit firewall
+uci commit nikki
+
+log "configured variant=${variant} interfaces=$(printf '%s' "$interfaces" | tr '\n' ' ')"
+exit 0

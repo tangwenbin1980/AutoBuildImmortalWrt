@@ -1,0 +1,261 @@
+name: Build x86-64 dual firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish a GitHub Release after all validation passes
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  IMMORTALWRT_VERSION: '25.12.1'
+  IMAGEBUILDER_IMAGE: immortalwrt/imagebuilder:x86-64-openwrt-25.12.1
+  ROOTFS_PARTSIZE: '8192'
+  UPSTREAM_SHA: 2fad7e1571f35c39831d761a7359480c7e3815e7
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Validate static policy and firstboot behavior
+        run: |
+          chmod +x dual-firmware/scripts/*.sh
+          chmod +x dual-firmware/tests/*.sh dual-firmware/tests/mock-bin/uci
+          dual-firmware/scripts/validate-static.sh
+
+      - name: Verify upstream baseline
+        run: |
+          set -Eeuo pipefail
+          actual=$(git ls-remote https://github.com/wukongdaily/ImmortalWrt-ImageBuilder.git refs/heads/master | awk '{print $1}')
+          test "$actual" = "$UPSTREAM_SHA"
+          test "$(git rev-parse HEAD^0)" != ""
+
+  build:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - home-bypass
+          - office-gateway
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare directories and overlay
+        run: |
+          set -Eeuo pipefail
+          chmod +x dual-firmware/scripts/*.sh
+          mkdir -p "bin/${{ matrix.variant }}" "out/${{ matrix.variant }}" "build/overlay"
+          cp x86-64/imm25.config "build/imm25-${{ matrix.variant }}.config"
+          dual-firmware/scripts/prepare-overlay.sh \
+            "${{ matrix.variant }}" \
+            "${{ github.workspace }}/build/overlay/${{ matrix.variant }}"
+
+      - name: Build with the native ImmortalWrt ImageBuilder
+        run: |
+          set -Eeuo pipefail
+          docker pull "$IMAGEBUILDER_IMAGE"
+          docker run --rm -i \
+            --user root \
+            -v "${{ github.workspace }}/dual-firmware:/workspace/dual-firmware:ro" \
+            -v "${{ github.workspace }}/build/overlay/${{ matrix.variant }}:/workspace/overlay:ro" \
+            -v "${{ github.workspace }}/build/imm25-${{ matrix.variant }}.config:/home/build/immortalwrt/.config" \
+            -v "${{ github.workspace }}/bin/${{ matrix.variant }}:/home/build/immortalwrt/bin" \
+            -v "${{ github.workspace }}/out/${{ matrix.variant }}:/workspace/out" \
+            -e FIRMWARE_VARIANT="${{ matrix.variant }}" \
+            -e OVERLAY_DIR=/workspace/overlay \
+            -e OUTPUT_DIR=/workspace/out \
+            "$IMAGEBUILDER_IMAGE" \
+            /bin/bash /workspace/dual-firmware/scripts/build-image.sh \
+            2>&1 | tee "out/${{ matrix.variant }}/build.log"
+
+          repo_root=$(git rev-parse --show-toplevel)
+          for path in \
+            "$repo_root/bin/${{ matrix.variant }}" \
+            "$repo_root/out/${{ matrix.variant }}"
+          do
+            case "$path" in
+              "$repo_root"/*) ;;
+              *) echo "ownership target escaped repository: $path" >&2; exit 1 ;;
+            esac
+          done
+          sudo chown -R "$(id -u):$(id -g)" \
+            "$repo_root/bin/${{ matrix.variant }}" \
+            "$repo_root/out/${{ matrix.variant }}"
+
+      - name: Stage and audit artifact
+        run: |
+          set -Eeuo pipefail
+          dual-firmware/scripts/stage-artifact.sh \
+            "${{ matrix.variant }}" \
+            "bin/${{ matrix.variant }}" \
+            "out/${{ matrix.variant }}"
+          dual-firmware/scripts/audit-manifest.sh \
+            "out/${{ matrix.variant }}/full-manifest.txt"
+
+      - name: Install image inspection and QEMU tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect ovmf qemu-system-x86 squashfs-tools
+
+      - name: Inspect final image
+        run: |
+          set -Eeuo pipefail
+          image=$(find "out/${{ matrix.variant }}/release" -maxdepth 1 -type f -name '*.img.gz')
+          test -n "$image"
+          dual-firmware/scripts/inspect-image.sh \
+            "${{ matrix.variant }}" \
+            "$image" \
+            dual-firmware/config/forbidden-packages.txt \
+            "out/${{ matrix.variant }}/inspection"
+
+      - name: Boot final image with QEMU and UEFI
+        run: |
+          set -Eeuo pipefail
+          image=$(find "out/${{ matrix.variant }}/release" -maxdepth 1 -type f -name '*.img.gz')
+          dual-firmware/scripts/qemu-smoke-test.sh \
+            "${{ matrix.variant }}" \
+            "$image" \
+            "out/${{ matrix.variant }}/inspection"
+
+      - name: Upload validated variant
+        uses: actions/upload-artifact@v7
+        with:
+          name: immortalwrt-${{ matrix.variant }}
+          path: |
+            out/${{ matrix.variant }}/release/*
+            out/${{ matrix.variant }}/full-manifest.txt
+            out/${{ matrix.variant }}/build-parameters.txt
+            out/${{ matrix.variant }}/artifact-metadata.txt
+            out/${{ matrix.variant }}/build.log
+            out/${{ matrix.variant }}/inspection/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: ${{ inputs.publish_release }}
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download validated artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: immortalwrt-*
+          path: release-assets
+          merge-multiple: false
+
+      - name: Final cross-variant audit
+        run: |
+          set -Eeuo pipefail
+          mapfile -t images < <(find release-assets -type f -name '*.img.gz' | sort)
+          test "${#images[@]}" -eq 2
+          home=$(find release-assets -type f -name '*home-bypass*.img.gz')
+          office=$(find release-assets -type f -name '*office-gateway*.img.gz')
+          test -n "$home"
+          test -n "$office"
+          test "$(sha256sum "$home" | awk '{print $1}')" != "$(sha256sum "$office" | awk '{print $1}')"
+
+          while IFS= read -r checksum; do
+            (
+              cd "$(dirname "$checksum")"
+              sha256sum --check "$(basename "$checksum")"
+            )
+          done < <(find release-assets -type f -name '*.sha256')
+
+      - name: Prepare uniquely named release assets
+        run: |
+          set -Eeuo pipefail
+          mkdir -p publish
+          for variant in home-bypass office-gateway; do
+            source_dir="release-assets/immortalwrt-${variant}"
+            test -d "$source_dir"
+            cp "$source_dir"/release/*.img.gz publish/
+            cp "$source_dir"/release/*.sha256 publish/
+            cp "$source_dir/full-manifest.txt" "publish/full-manifest-${variant}.txt"
+            cp "$source_dir/build-parameters.txt" "publish/build-parameters-${variant}.txt"
+            cp "$source_dir/artifact-metadata.txt" "publish/artifact-metadata-${variant}.txt"
+            cp "$source_dir/inspection/image-inspection.txt" "publish/image-inspection-${variant}.txt"
+            cp "$source_dir/inspection/qemu-smoke-result.txt" "publish/qemu-smoke-result-${variant}.txt"
+            cp "$source_dir/inspection/partition-layout.txt" "publish/partition-layout-${variant}.txt"
+            cp "$source_dir/inspection/installed-packages.txt" "publish/installed-packages-${variant}.txt"
+          done
+          test "$(find publish -maxdepth 1 -type f | wc -l)" -eq 18
+          duplicate_names=$(find publish -maxdepth 1 -type f -printf '%f\n' | sort | uniq -d)
+          test -z "$duplicate_names"
+
+      - name: Create release notes
+        run: |
+          cat > release-notes.md <<EOF
+          # ImmortalWrt 25.12.1 x86-64 双固件
+
+          - 上游：wukongdaily/ImmortalWrt-ImageBuilder
+          - 上游 SHA：$UPSTREAM_SHA
+          - workflow SHA：$GITHUB_SHA
+          - ImageBuilder：$IMAGEBUILDER_IMAGE
+          - ROOTFS_PARTSIZE：8192 MiB
+
+          ## home-bypass
+
+          - 管理地址：10.0.0.2/24
+          - 上游网关：10.0.0.1
+          - LAN DHCP：关闭
+          - WAN/WAN6：未指定设备、禁用且不自动连接
+
+          ## office-gateway
+
+          - 管理地址：192.168.10.1/24
+          - WAN：eth0 DHCP
+          - LAN DHCP：192.168.10.100–192.168.10.249，租期 12 小时
+          - WAN IPv4 NAT：开启
+
+          ## Nikki
+
+          - 控制器端口：9090
+          - 控制器 API secret：abc123
+          - Zashboard：在线下载，不内置离线面板
+          - 本项目首启脚本不修改 Nikki TUN 字段
+
+          ## 登录安全
+
+          root 初始密码保持 ImmortalWrt 原生为空。首次登录 LuCI 后请立即设置强密码。
+
+          两份固件均已通过 manifest 策略、最终镜像解包检查、SHA256 回验和 QEMU/UEFI 启动测试。
+          EOF
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          date_tag=$(date -u +%Y%m%d)
+          tag="immortalwrt-25.12.1-dual-v1.1-${date_tag}-r${GITHUB_RUN_NUMBER}"
+          mapfile -t assets < <(find publish -maxdepth 1 -type f -print | sort)
+          test "${#assets[@]}" -eq 18
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "ImmortalWrt 25.12.1 双固件 v1.1 (${date_tag})" \
+            --notes-file release-notes.md \
+            "${assets[@]}"
