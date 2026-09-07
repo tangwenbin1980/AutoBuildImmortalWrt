@@ -32,15 +32,26 @@ trap cleanup EXIT
 gzip -dc "$image" |
 	dd of="$raw_image" bs=4M conv=sparse status=none
 
-ovmf=$(
-	find /usr/share/OVMF /usr/share/ovmf -type f \
-		\( -name 'OVMF_CODE.fd' -o -name 'OVMF_CODE_4M.fd' \) \
-		-print -quit 2>/dev/null
-)
-[[ -n "$ovmf" ]] || {
-	echo "OVMF firmware not found" >&2
+ovmf_code=''
+ovmf_vars=''
+for directory in /usr/share/OVMF /usr/share/ovmf; do
+	if [[ -f "$directory/OVMF_CODE_4M.fd" && -f "$directory/OVMF_VARS_4M.fd" ]]; then
+		ovmf_code="$directory/OVMF_CODE_4M.fd"
+		ovmf_vars="$directory/OVMF_VARS_4M.fd"
+		break
+	fi
+	if [[ -f "$directory/OVMF_CODE.fd" && -f "$directory/OVMF_VARS.fd" ]]; then
+		ovmf_code="$directory/OVMF_CODE.fd"
+		ovmf_vars="$directory/OVMF_VARS.fd"
+		break
+	fi
+done
+[[ -n "$ovmf_code" && -n "$ovmf_vars" ]] || {
+	echo "matching OVMF CODE/VARS firmware pair not found" >&2
 	exit 1
 }
+ovmf_vars_copy="$work_dir/OVMF_VARS.fd"
+cp "$ovmf_vars" "$ovmf_vars_copy"
 
 if [[ "$variant" == 'home-bypass' ]]; then
 	# shellcheck disable=SC2016
@@ -70,7 +81,8 @@ fi
 
 export QEMU_VARIANT="$variant"
 export QEMU_IMAGE="$raw_image"
-export QEMU_OVMF="$ovmf"
+export QEMU_OVMF_CODE="$ovmf_code"
+export QEMU_OVMF_VARS="$ovmf_vars_copy"
 export QEMU_LOG="$log_file"
 export QEMU_GUEST_ASSERTIONS="$guest_assertions"
 
@@ -81,7 +93,8 @@ spawn qemu-system-x86_64 \
 	-machine accel=tcg \
 	-m 512 \
 	-nographic \
-	-bios $env(QEMU_OVMF) \
+	-drive if=pflash,format=raw,readonly=on,file=$env(QEMU_OVMF_CODE) \
+	-drive if=pflash,format=raw,file=$env(QEMU_OVMF_VARS) \
 	-drive file=$env(QEMU_IMAGE),format=raw,if=virtio \
 	-netdev user,id=net0 -device e1000,netdev=net0 \
 	-netdev user,id=net1 -device e1000,netdev=net1 \
