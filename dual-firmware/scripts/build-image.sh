@@ -5,7 +5,7 @@ set -Eeuo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 project_dir=$(cd -- "$script_dir/.." && pwd)
 
-# shellcheck source=../config/build.env
+# shellcheck disable=SC1091
 source "$project_dir/config/build.env"
 
 : "${FIRMWARE_VARIANT:?FIRMWARE_VARIANT is required}"

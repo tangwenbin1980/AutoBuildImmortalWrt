@@ -6,7 +6,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 project_dir=$(cd -- "$script_dir/.." && pwd)
 repo_dir=$(cd -- "$project_dir/.." && pwd)
 
-# shellcheck source=../config/build.env
+# shellcheck disable=SC1091
 source "$project_dir/config/build.env"
 
 expected_packages='nikki luci-app-nikki luci-i18n-nikki-zh-cn luci-theme-argon luci-app-argon-config'

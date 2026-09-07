@@ -43,6 +43,7 @@ ovmf=$(
 }
 
 if [[ "$variant" == 'home-bypass' ]]; then
+	# shellcheck disable=SC2016
 	guest_assertions='
 test "$(uci -q get network.lan.ipaddr)" = "10.0.0.2"
 test "$(uci -q get network.lan.gateway)" = "10.0.0.1"
@@ -55,6 +56,7 @@ test "$(uci -q get network.wan6.disabled)" = "1"
 test -z "$(uci -q get network.wan6.device || true)"
 '
 else
+	# shellcheck disable=SC2016
 	guest_assertions='
 test "$(uci -q get network.lan.ipaddr)" = "192.168.10.1"
 test "$(uci -q get network.wan.device)" = "eth0"

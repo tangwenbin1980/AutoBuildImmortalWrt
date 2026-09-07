@@ -14,7 +14,7 @@ project_dir=$(cd -- "$script_dir/.." && pwd)
 repo_dir=$(cd -- "$project_dir/.." && pwd)
 workspace_dir=${GITHUB_WORKSPACE:-$repo_dir}
 
-# shellcheck source=../config/build.env
+# shellcheck disable=SC1091
 source "$project_dir/config/build.env"
 
 case "$variant" in
