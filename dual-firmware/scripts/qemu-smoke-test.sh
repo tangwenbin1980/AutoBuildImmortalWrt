@@ -119,6 +119,16 @@ expect {
 	}
 }
 
+send {for i in $(seq 1 180); do [ ! -e /etc/uci-defaults/99zz-dual-firmware ] && break; sleep 1; done; test ! -e /etc/uci-defaults/99zz-dual-firmware; echo __DUAL_FIRMWARE_FIRSTBOOT_"READY__"}
+send "\r"
+expect {
+	"__DUAL_FIRMWARE_FIRSTBOOT_READY__" {}
+	timeout {
+		puts stderr "firstboot configuration did not complete"
+		exit 1
+	}
+}
+
 send "set -eu\r"
 send "grep -Fx 'firmware_variant=$env(QEMU_VARIANT)' /etc/firmware_variant.txt\r"
 send "$env(QEMU_GUEST_ASSERTIONS)\r"
@@ -128,7 +138,8 @@ send {test "$(uci -q get nikki.mixin.api_secret)" = 'abc123'}
 send "\r"
 send {test "$(uci -q get nikki.mixin.ui_url)" = 'https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip'}
 send "\r"
-send "echo __DUAL_FIRMWARE_SMOKE_PASS__\r"
+send {echo __DUAL_FIRMWARE_SMOKE_"PASS__"}
+send "\r"
 
 expect {
 	"__DUAL_FIRMWARE_SMOKE_PASS__" {}
