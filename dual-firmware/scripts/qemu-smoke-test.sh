@@ -122,9 +122,12 @@ expect {
 send "set -eu\r"
 send "grep -Fx 'firmware_variant=$env(QEMU_VARIANT)' /etc/firmware_variant.txt\r"
 send "$env(QEMU_GUEST_ASSERTIONS)\r"
-send "test \"\\$(uci -q get nikki.mixin.api_listen)\" = '[::]:9090'\r"
-send "test \"\\$(uci -q get nikki.mixin.api_secret)\" = 'abc123'\r"
-send "test \"\\$(uci -q get nikki.mixin.ui_url)\" = 'https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip'\r"
+send {test "$(uci -q get nikki.mixin.api_listen)" = '[::]:9090'}
+send "\r"
+send {test "$(uci -q get nikki.mixin.api_secret)" = 'abc123'}
+send "\r"
+send {test "$(uci -q get nikki.mixin.ui_url)" = 'https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip'}
+send "\r"
 send "echo __DUAL_FIRMWARE_SMOKE_PASS__\r"
 
 expect {
