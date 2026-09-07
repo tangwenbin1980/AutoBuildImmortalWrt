@@ -74,7 +74,7 @@ mounted=1
 grep -Fxq "firmware_variant=$variant" "$mount_dir/etc/firmware_variant.txt"
 
 root_password=$(
-	awk -F: '$1 == "root" { print $2; exit }' "$mount_dir/etc/shadow"
+	sudo awk -F: '$1 == "root" { print $2; exit }' "$mount_dir/etc/shadow"
 )
 [[ -z "$root_password" ]] || {
 	echo "root password field is not empty" >&2
@@ -82,7 +82,7 @@ root_password=$(
 }
 
 [[ -f "$mount_dir/lib/apk/db/installed" ]]
-awk -F: '$1 == "P" { print $2 }' "$mount_dir/lib/apk/db/installed" |
+sudo awk -F: '$1 == "P" { print $2 }' "$mount_dir/lib/apk/db/installed" |
 	sort -u >"$report_dir/installed-packages.txt"
 
 required=(
